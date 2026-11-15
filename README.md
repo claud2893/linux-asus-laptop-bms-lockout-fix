@@ -11,7 +11,7 @@ This triggers a safety lockout inside the replacement battery's BMS, cutting the
 ## Repository Contents
 
 * `fix-asus-battery-bms.sh` — Automated setup script that configures GRUB and installs the required `systemd` services.
-* `guide.md` — Technical overview, manual installation steps, verification, and recovery instructions.
+* `asus_ux535ftc_battery_fix_guide.md` — Technical overview, manual installation steps, verification, and recovery instructions.
 
 ---
 
