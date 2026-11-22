@@ -8,10 +8,12 @@ Non-original replacement batteries use generic Battery Management System (BMS) m
 
 This triggers a safety lockout inside the replacement battery's BMS, cutting the main voltage rail to $0\text{V}$ (requiring physical battery disconnection to recover). Because the Asus UX535FTC lacks a separate CMOS coin-cell battery, losing main battery power also resets the motherboard's Real-Time Clock (RTC).
 
+Because desktop power daemons (`upowerd`, `systemd-backlight`) and dependent sub-modules hold active references to `asus_wmi` until userspace has completely stopped, unloading the modules must occur in a late-stage `systemd-shutdown` hook after clearing `/sys/module/asus_wmi/holders`.
+
 ## Repository Contents
 
-* `fix-asus-battery-bms.sh` — Automated setup script that configures GRUB and installs the required `systemd` services.
-* `asus_ux535ftc_battery_fix_guide.md` — Technical overview, manual installation steps, verification, and recovery instructions.
+* `fix-asus-battery-bms.sh` — Automated setup script that configures GRUB, disables `XHC` USB wakeup, and installs the late-stage `systemd-shutdown` hook (also automatically upgrades installations from `v1.0.0`).
+* `README.md` — Technical overview, manual installation steps, verification, and recovery instructions.
 
 ---
 
@@ -19,9 +21,10 @@ This triggers a safety lockout inside the replacement battery's BMS, cutting the
 
 > **Safety Note:** Always inspect scripts before executing them with `sudo`. This script automatically creates a timestamped backup of `/etc/default/grub` before modifying it and supports Fedora/RHEL (`grub2-mkconfig`) as well as Debian/Ubuntu (`update-grub`).
 
-1. Make the script executable:
+1. Download the latest release script (or use the copy in this repository) and make it executable:
 
    ```bash
+   curl -LO https://github.com/claud2893/asus-ux535-linux-battery-fix/releases/latest/download/fix-asus-battery-bms.sh
    chmod +x fix-asus-battery-bms.sh
    ```
 
@@ -96,41 +99,36 @@ If the Intel xHCI USB Host Controller (`XHC`) remains enabled as an ACPI wake so
    sudo systemctl enable --now disable-xhc-wakeup.service
    ```
 
-### Step 3: Unload Asus WMI Modules Cleanly Before Shutdown
+### Step 3: Unload Asus WMI Modules via Late-Stage `systemd-shutdown`
 
-The `asus_wmi` and `asus_nb_wmi` kernel modules are required during an active session to translate proprietary hotkeys such as `Fn+F6` (touchpad toggle) and `Fn+F7` (keyboard backlight). However, their driver unbind routines during standard shutdown teardown can crash a third-party BMS. Unloading these modules via a pre-shutdown hook preserves hotkey support while ensuring a clean power-off.
+The `asus_wmi` and `asus_nb_wmi` kernel modules are required during an active session to translate proprietary hotkeys such as `Fn+F6` (touchpad toggle) and `Fn+F7` (keyboard backlight). However, unloading them at `shutdown.target` often fails (`Module asus_wmi is in use`) because desktop services and dependent sub-modules still hold open references. Placing an executable script in `/usr/lib/systemd/system-shutdown/` ensures `asus_wmi` and its holders are unloaded right before kernel power-off after all userspace processes have exited.
 
-1. Ensure no modprobe blacklist or custom option files are blocking the modules, and rebuild `initramfs` if needed:
+1. Ensure no modprobe blacklist or custom option files are blocking the modules, and remove any legacy `unload-asus-wmi.service` unit:
 
    ```bash
    sudo rm -f /etc/modprobe.d/blacklist-asus-wmi.conf /etc/modprobe.d/asus_wmi.conf
-   sudo dracut --force
-   ```
-
-2. Create a `systemd` service that unloads `asus_nb_wmi` and `asus_wmi` right before the kernel executes shutdown or reboot:
-
-   ```bash
-   cat << 'EOF' | sudo tee /etc/systemd/system/unload-asus-wmi.service
-   [Unit]
-   Description=Unload ASUS WMI modules cleanly before shutdown
-   DefaultDependencies=no
-   Before=shutdown.target reboot.target halt.target
-
-   [Service]
-   Type=oneshot
-   ExecStart=-/usr/sbin/modprobe -r asus_nb_wmi asus_wmi
-
-   [Install]
-   WantedBy=halt.target reboot.target shutdown.target
-   EOF
-   ```
-
-3. Reload `systemd` and enable the service *(do **not** use `--now`, as it should only run when shutting down or rebooting)*:
-
-   ```bash
+   sudo systemctl disable unload-asus-wmi.service 2>/dev/null || true
+   sudo rm -f /etc/systemd/system/unload-asus-wmi.service
    sudo systemctl daemon-reload
-   sudo systemctl enable unload-asus-wmi.service
    ```
+
+2. Create the late-stage shutdown hook and make it executable:
+
+   ```bash
+   sudo mkdir -p /usr/lib/systemd/system-shutdown
+   cat << 'EOF' | sudo tee /usr/lib/systemd/system-shutdown/unload-asus-wmi.shutdown
+   #!/bin/sh
+   if [ -d /sys/module/asus_wmi/holders ]; then
+       for holder in /sys/module/asus_wmi/holders/*; do
+           [ -e "$holder" ] && /usr/sbin/modprobe -r "$(basename "$holder")" 2>/dev/null || true
+       done
+   fi
+   /usr/sbin/modprobe -r asus_nb_wmi asus_wmi 2>/dev/null || true
+   EOF
+   sudo chmod +x /usr/lib/systemd/system-shutdown/unload-asus-wmi.shutdown
+   ```
+
+> **Dual-Boot Tip (Windows):** If you dual-boot with Windows, disable **Turn on fast startup** under *Control Panel → Power Options → Choose what the power buttons do* so Windows performs a cold shutdown instead of leaving Embedded Controller states latched across reboots.
 
 > **Fallback Option:** If you ever need a stricter fallback, permanently blacklisting `asus_wmi` and `asus_nb_wmi` in `/etc/modprobe.d/blacklist-asus-wmi.conf` followed by `sudo dracut --force` will isolate the battery completely at the cost of `Fn+F6` and `Fn+F7`.
 
@@ -157,14 +155,14 @@ sudo hwclock --systohc
 
 ### Revert / Uninstall Changes
 
-To remove the `systemd` services and restore your original GRUB configuration:
+To remove the `systemd` units, shutdown hook, and restore your original GRUB configuration:
 
-1. Disable and remove both unit files:
+1. Remove the shutdown hook and wakeup service:
 
    ```bash
+   sudo rm -f /usr/lib/systemd/system-shutdown/unload-asus-wmi.shutdown
    sudo systemctl disable --now disable-xhc-wakeup.service
-   sudo systemctl disable unload-asus-wmi.service
-   sudo rm -f /etc/systemd/system/disable-xhc-wakeup.service /etc/systemd/system/unload-asus-wmi.service
+   sudo rm -f /etc/systemd/system/disable-xhc-wakeup.service
    sudo systemctl daemon-reload
    ```
 
